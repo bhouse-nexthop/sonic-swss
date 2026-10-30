@@ -162,6 +162,7 @@ int main(int argc, char **argv)
             s.addSelectable(&fpm);
             s.addSelectable(&netlink);
             s.addSelectable(macsync.getStateFdbTable());
+            s.addSelectable(macsync.getEsReAddTimer());
 
             if (sync.isSuppressionEnabled())
             {
@@ -215,6 +216,14 @@ int main(int argc, char **argv)
 
             gSelectTimeout = INFINITE;
 
+            /* MacSync's rows wait with the routes during a warm restart. */
+            auto flushWrites = [&]() {
+                if (!warmStartEnabled || sync.getWarmStartHelper().isReconciled())
+                {
+                    flushPipeline(pipeline);
+                }
+            };
+
             while (true)
             {
                 Selectable *temps;
@@ -231,9 +240,18 @@ int main(int argc, char **argv)
                     macsync.noteFpmMessage();
                 }
 
+                /* MacSync's handlers write VXLAN_FDB_TABLE too. */
                 if (temps == (Selectable *)macsync.getStateFdbTable())
                 {
                     macsync.processStateFdb();
+                    flushWrites();
+                    continue;
+                }
+
+                if (temps == (Selectable *)macsync.getEsReAddTimer())
+                {
+                    macsync.processEsReAdd();
+                    flushWrites();
                     continue;
                 }
 
@@ -255,6 +273,7 @@ int main(int argc, char **argv)
                     }
 
                     sync.onWarmStartEnd(applStateDb);
+                    macsync.onWarmStartEnd();
 
                     // remove the one-shot timer.
                     s.removeSelectable(temps);
