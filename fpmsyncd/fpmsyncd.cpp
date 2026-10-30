@@ -216,11 +216,22 @@ int main(int argc, char **argv)
 
             gSelectTimeout = INFINITE;
 
-            /* MacSync's rows wait with the routes during a warm restart. */
+            /*
+             * A warm restart holds the pipeline until the reconcile; MacSync's
+             * rows are not reconciled, so they go now. The flag stays until a
+             * flush empties the pipeline, since flushPipeline() may defer under
+             * load.
+             */
             auto flushWrites = [&]() {
-                if (!warmStartEnabled || sync.getWarmStartHelper().isReconciled())
+                if (!warmStartEnabled || sync.getWarmStartHelper().isReconciled() ||
+                    macsync.hasPendingWrites())
                 {
                     flushPipeline(pipeline);
+                }
+
+                if (pipeline.size() == 0)
+                {
+                    macsync.clearPendingWrites();
                 }
             };
 
@@ -341,9 +352,9 @@ int main(int argc, char **argv)
                         sync.onRouteResponse(key, fieldValues);
                     }
                 }
-                else if (!warmStartEnabled || sync.getWarmStartHelper().isReconciled())
+                else
                 {
-                    flushPipeline(pipeline);
+                    flushWrites();
                 }
             }
         }

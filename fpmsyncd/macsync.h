@@ -105,6 +105,11 @@ public:
 
     bool isFpmMode() const { return m_fpmMode; }
 
+    /* MacSync has written VXLAN_FDB_TABLE since the pipeline was last empty:
+     * the caller flushes it, which it otherwise holds during a warm restart. */
+    bool hasPendingWrites() const { return m_pendingWrites; }
+    void clearPendingWrites() { m_pendingWrites = false; }
+
 private:
     /* Local MACs already advertised to zebra, keyed "Vlan<id>:<mac>". */
     struct LocalMac
@@ -170,6 +175,7 @@ private:
     /* zebra has sent a remote MAC since the rows were marked stale. */
     bool m_remoteMacSinceStale {false};
     bool m_markedBefore {false};
+    bool m_pendingWrites {false};
 
     /* EVPN_DF_TABLE keys zebra holds: the VLANs of each local ES port. */
     std::set<std::string> m_esDfKeys;
