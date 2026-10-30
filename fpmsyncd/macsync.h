@@ -4,6 +4,8 @@
 #include <linux/rtnetlink.h>
 #include <linux/neighbour.h>
 
+#include <chrono>
+#include <ctime>
 #include <functional>
 #include <map>
 #include <string>
@@ -64,6 +66,27 @@ public:
      * are written. */
     void setLinkReader(std::function<void()> reader) { m_readLinks = std::move(reader); }
 
+    /*
+     * On every FPM connect the remote MACs in APPL_DB are stale until zebra
+     * sends them again: zebra replays what it holds, and a MAC it withdrew
+     * while fpmsyncd or the connection was down is never withdrawn otherwise.
+     * onStaleSweepTimer() withdraws the rest once zebra's replay and BGP's
+     * convergence are over. markRemoteMacsStale() returns false when nothing
+     * is stale.
+     */
+    static constexpr time_t STALE_SWEEP_HOLD = 120;
+    static constexpr time_t STALE_SWEEP_QUIET = 10;
+    static constexpr time_t STALE_SWEEP_MAX = 600;
+    bool markRemoteMacsStale(
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
+    time_t onStaleSweepTimer(
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
+    void noteFpmMessage(
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now())
+    {
+        m_lastFpmMessage = now;
+    }
+
     bool isFpmMode() const { return m_fpmMode; }
 
 private:
@@ -84,6 +107,7 @@ private:
                       LocalMac& local, bool add);
     void writeRemoteMac(const std::string& key, const std::vector<FieldValueTuple>& row);
     void removeRemoteMac(const std::string& key);
+    void withdrawStaleRemoteMacs();
 
     ProducerStateTable m_vxlanFdbTable;
     Table m_vxlanFdbTableRead;
@@ -117,6 +141,15 @@ private:
         std::vector<FieldValueTuple> row;
     };
     std::map<std::string, RemoteRow> m_remoteRows;
+    /* The remote rows at the last connect, in APPL_DB or queued, that zebra
+     * has not sent or withdrawn since. zebra's replay rewrites a row that
+     * differs; an empty one always does. */
+    std::map<std::string, std::vector<FieldValueTuple>> m_staleRemoteMacs;
+    std::chrono::steady_clock::time_point m_staleSince;
+    std::chrono::steady_clock::time_point m_lastFpmMessage;
+    /* zebra has sent a remote MAC since the rows were marked stale. */
+    bool m_remoteMacSinceStale {false};
+    bool m_markedBefore {false};
 };
 
 }

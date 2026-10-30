@@ -145,6 +145,7 @@ int main(int argc, char **argv)
             SelectableTimer eoiuCheckTimer(timespec{0, 0});
             // After eoiu flags are detected, start a hold timer before starting reconciliation.
             SelectableTimer eoiuHoldTimer(timespec{0, 0});
+            SelectableTimer macStaleTimer(timespec{0, 0});
            
             /*
              * Pipeline should be flushed right away to deal with state pending
@@ -205,6 +206,13 @@ int main(int argc, char **argv)
                 sync.getWarmStartHelper().setState(WarmStart::WSDISABLED);
             }
 
+            if (macsync.markRemoteMacsStale())
+            {
+                macStaleTimer.setInterval(timespec{MacSync::STALE_SWEEP_HOLD, 0});
+                macStaleTimer.start();
+                s.addSelectable(&macStaleTimer);
+            }
+
             gSelectTimeout = INFINITE;
 
             while (true)
@@ -217,6 +225,11 @@ int main(int argc, char **argv)
                  * MACs to send to zebra.
                  */
                 s.select(&temps, gSelectTimeout);
+
+                if (temps == (Selectable *)&fpm)
+                {
+                    macsync.noteFpmMessage();
+                }
 
                 if (temps == (Selectable *)macsync.getStateFdbTable())
                 {
@@ -247,6 +260,21 @@ int main(int argc, char **argv)
                     s.removeSelectable(temps);
                     pipeline.flush();
                     SWSS_LOG_DEBUG("Pipeline flushed");
+                }
+                else if (temps == &macStaleTimer)
+                {
+                    time_t wait = macsync.onStaleSweepTimer();
+
+                    if (wait)
+                    {
+                        macStaleTimer.setInterval(timespec{wait, 0});
+                        macStaleTimer.start();
+                    }
+                    else
+                    {
+                        s.removeSelectable(&macStaleTimer);
+                        pipeline.flush();
+                    }
                 }
                 else if (temps == &eoiuCheckTimer)
                 {
