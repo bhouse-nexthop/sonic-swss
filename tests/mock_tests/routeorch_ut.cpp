@@ -72,6 +72,21 @@ namespace routeorch_test
     /* Called for each route entry the bulk create or remove is handed, when set */
     std::function<void(const sai_route_entry_t &)> create_route_probe;
     std::function<void(const sai_route_entry_t &)> remove_route_probe;
+    /* When not success, every route entry a bulk create or set is handed fails with this status */
+    sai_status_t route_entries_status = SAI_STATUS_SUCCESS;
+    /* When not success, every neighbor create fails with this status */
+    sai_status_t neighbor_create_status = SAI_STATUS_SUCCESS;
+    sai_create_neighbor_entry_fn old_create_neighbor_entry = nullptr;
+
+    sai_status_t _ut_stub_sai_create_neighbor_entry(const sai_neighbor_entry_t *neighbor_entry, uint32_t attr_count,
+                                                    const sai_attribute_t *attr_list)
+    {
+        if (neighbor_create_status != SAI_STATUS_SUCCESS)
+        {
+            return neighbor_create_status;
+        }
+        return old_create_neighbor_entry(neighbor_entry, attr_count, attr_list);
+    }
     int set_route_count = 0;
     int remove_route_count = 0;
     int sai_fail_count = 0;
@@ -96,6 +111,11 @@ namespace routeorch_test
         for (uint32_t i = 0; create_route_probe && i < object_count; i++)
         {
             create_route_probe(route_entry[i]);
+        }
+        if (route_entries_status != SAI_STATUS_SUCCESS)
+        {
+            std::fill(object_statuses, object_statuses + object_count, route_entries_status);
+            return SAI_STATUS_FAILURE;
         }
         return old_create_route_entries(object_count, route_entry, attr_count, attr_list, mode, object_statuses);
     }
@@ -122,6 +142,11 @@ namespace routeorch_test
         _Out_ sai_status_t *object_statuses)
     {
         set_route_count++;
+        if (route_entries_status != SAI_STATUS_SUCCESS)
+        {
+            std::fill(object_statuses, object_statuses + object_count, route_entries_status);
+            return SAI_STATUS_FAILURE;
+        }
 
         // Make sure there is not conflict settings
         bool drop = false;
@@ -424,6 +449,7 @@ namespace routeorch_test
         void TearDown() override
         {
             gEnableFibSuppress = false;
+            route_entries_status = SAI_STATUS_SUCCESS;
 
             RestoreSaiApis();
             DEINIT_SAI_API_MOCK(route);
@@ -1887,9 +1913,17 @@ namespace routeorch_test
     {
     protected:
         VxlanTunnelOrch *m_vxlanTunnelOrch = nullptr;
+        sai_neighbor_api_t *m_savedNeighborApi = nullptr;
+        sai_neighbor_api_t m_neighborApi;
 
         void TearDown() override
         {
+            neighbor_create_status = SAI_STATUS_SUCCESS;
+            if (m_savedNeighborApi)
+            {
+                sai_neighbor_api = m_savedNeighborApi;
+                m_savedNeighborApi = nullptr;
+            }
             RouteOrchTest::TearDown();
             delete m_vxlanTunnelOrch;
             m_vxlanTunnelOrch = nullptr;
@@ -2012,6 +2046,55 @@ namespace routeorch_test
         {
             auto &table = gRouteOrch->m_syncdRoutes[gVirtualRouterId];
             return table.find(IpPrefix(prefix)) != table.end();
+        }
+
+        /* The tunnel next hop of TunnelHostRoute(), here over a real next hop object */
+        NextHopKey AddTunnelNextHop()
+        {
+            NextHopKey tunnel_nh("10.0.0.2@vniEthernet0@5000@00:00:0a:00:00:99", true);
+            NextHopEntry nh_entry;
+            nh_entry.next_hop_id = gNeighOrch->getNextHopId(NextHopKey(IpAddress("10.0.0.2"), string("Ethernet0")));
+            EXPECT_NE(nh_entry.next_hop_id, SAI_NULL_OBJECT_ID);
+            nh_entry.ref_count = 0;
+            nh_entry.nh_flags = 0;
+            gNeighOrch->m_syncdNextHops[tunnel_nh] = nh_entry;
+            gVrfOrch->l3vni_table_[5000].l3_vni = true;
+            return tunnel_nh;
+        }
+
+        /* The symmetric IRB host route of TN_IP over the tunnel next hop */
+        void TunnelHostRoute(const string &op)
+        {
+            auto consumer = dynamic_cast<Consumer *>(gRouteOrch->getExecutor(APP_ROUTE_TABLE_NAME));
+            std::deque<KeyOpFieldsValuesTuple> entries;
+            vector<FieldValueTuple> fvs;
+            if (op == SET_COMMAND)
+            {
+                fvs = { { "ifname", "Ethernet0" }, { "nexthop", "10.0.0.2" },
+                        { "vni_label", "5000" }, { "router_mac", "00:00:0a:00:00:99" } };
+            }
+            entries.push_back({ TN_IP + "/32", op, fvs });
+            consumer->addToSync(entries);
+            static_cast<Orch *>(gRouteOrch)->doTask();
+        }
+
+        /* Neighbor creates fail with this status until it is set back to success */
+        void FailNeighborCreates(sai_status_t status)
+        {
+            if (!m_savedNeighborApi)
+            {
+                m_savedNeighborApi = sai_neighbor_api;
+                m_neighborApi = *sai_neighbor_api;
+                old_create_neighbor_entry = m_neighborApi.create_neighbor_entry;
+                m_neighborApi.create_neighbor_entry = _ut_stub_sai_create_neighbor_entry;
+                sai_neighbor_api = &m_neighborApi;
+            }
+            neighbor_create_status = status;
+        }
+
+        size_t PendingRoutes()
+        {
+            return dynamic_cast<Consumer *>(gRouteOrch->getExecutor(APP_ROUTE_TABLE_NAME))->m_toSync.size();
         }
     };
 
@@ -2188,6 +2271,152 @@ namespace routeorch_test
         EXPECT_EQ(NhRefs(TN_IP), 0);
         EXPECT_TRUE(gNeighOrch->m_tunnelMacNeighbors.empty());
         EXPECT_TRUE(gNeighOrch->m_tunnelHostRoutes.empty());
+        gNeighOrch->m_syncdNextHops.erase(tunnel_nh);
+    }
+
+    /*
+     * The SAI refuses a host route over a tunnel for lack of resources: the
+     * neighbor is programmed again while the route waits, and steps aside once
+     * a retry programs the route.
+     */
+    TEST_F(RouteOrchTunnelMacTest, RefusedTunnelHostRouteKeepsNeighbor)
+    {
+        RemoteMac(TN_MAC, "1.1.1.1");
+        LearnNeighbor(TN_IP, TN_MAC);
+        ASSERT_TRUE(gNeighOrch->isHwConfigured(TN_NEIGH));
+        NextHopKey tunnel_nh = AddTunnelNextHop();
+
+        route_entries_status = SAI_STATUS_TABLE_FULL;
+        TunnelHostRoute(SET_COMMAND);
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        route_entries_status = SAI_STATUS_SUCCESS;
+
+        EXPECT_FALSE(RouteInstalled(TN_IP + "/32"));
+        EXPECT_EQ(PendingRoutes(), 1u);
+        EXPECT_TRUE(gNeighOrch->isHwConfigured(TN_NEIGH));
+        EXPECT_TRUE(gNeighOrch->m_tunnelHostRoutes.empty());
+
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_TRUE(RouteInstalled(TN_IP + "/32"));
+        EXPECT_EQ(PendingRoutes(), 0u);
+        EXPECT_FALSE(gNeighOrch->isHwConfigured(TN_NEIGH));
+        EXPECT_EQ(gNeighOrch->m_tunnelHostRoutes.size(), 1u);
+
+        TunnelHostRoute(DEL_COMMAND);
+        EXPECT_FALSE(RouteInstalled(TN_IP + "/32"));
+        EXPECT_TRUE(gNeighOrch->isHwConfigured(TN_NEIGH));
+        EXPECT_TRUE(gNeighOrch->m_tunnelHostRoutes.empty());
+        gNeighOrch->m_syncdNextHops.erase(tunnel_nh);
+    }
+
+    /*
+     * The SAI refuses to move a host route onto a tunnel next hop: the route
+     * keeps its previous next hop, so its neighbor stays programmed until a
+     * retry moves the route.
+     */
+    TEST_F(RouteOrchTunnelMacTest, RefusedMoveOntoTunnelKeepsNeighbor)
+    {
+        RemoteMac(TN_MAC, "1.1.1.1");
+        LearnNeighbor(TN_IP, TN_MAC);
+        NextHopKey tunnel_nh = AddTunnelNextHop();
+        Route(TN_IP + "/32", "10.0.0.2", "Ethernet0");
+        ASSERT_TRUE(RouteInstalled(TN_IP + "/32"));
+        ASSERT_TRUE(gNeighOrch->isHwConfigured(TN_NEIGH));
+
+        route_entries_status = SAI_STATUS_TABLE_FULL;
+        TunnelHostRoute(SET_COMMAND);
+        route_entries_status = SAI_STATUS_SUCCESS;
+
+        auto &route = gRouteOrch->m_syncdRoutes[gVirtualRouterId][IpPrefix(TN_IP + "/32")];
+        EXPECT_FALSE(route.nhg_key.is_overlay_nexthop());
+        EXPECT_EQ(PendingRoutes(), 1u);
+        EXPECT_TRUE(gNeighOrch->isHwConfigured(TN_NEIGH));
+        EXPECT_TRUE(gNeighOrch->m_tunnelHostRoutes.empty());
+
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        EXPECT_TRUE(gRouteOrch->m_syncdRoutes[gVirtualRouterId][IpPrefix(TN_IP + "/32")].nhg_key.is_overlay_nexthop());
+        EXPECT_EQ(PendingRoutes(), 0u);
+        EXPECT_FALSE(gNeighOrch->isHwConfigured(TN_NEIGH));
+
+        TunnelHostRoute(DEL_COMMAND);
+        EXPECT_TRUE(gNeighOrch->isHwConfigured(TN_NEIGH));
+        EXPECT_TRUE(gNeighOrch->m_tunnelHostRoutes.empty());
+        gNeighOrch->m_syncdNextHops.erase(tunnel_nh);
+    }
+
+    /*
+     * The host route over a tunnel is removed and created again in one batch,
+     * and the SAI refuses the create: the neighbor is programmed again while
+     * the route waits.
+     */
+    TEST_F(RouteOrchTunnelMacTest, RefusedTunnelHostRouteRecreateKeepsNeighbor)
+    {
+        RemoteMac(TN_MAC, "1.1.1.1");
+        LearnNeighbor(TN_IP, TN_MAC);
+        NextHopKey tunnel_nh = AddTunnelNextHop();
+        TunnelHostRoute(SET_COMMAND);
+        ASSERT_TRUE(RouteInstalled(TN_IP + "/32"));
+        ASSERT_FALSE(gNeighOrch->isHwConfigured(TN_NEIGH));
+
+        auto consumer = dynamic_cast<Consumer *>(gRouteOrch->getExecutor(APP_ROUTE_TABLE_NAME));
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({ TN_IP + "/32", DEL_COMMAND, {} });
+        entries.push_back({ TN_IP + "/32", SET_COMMAND, { { "ifname", "Ethernet0" }, { "nexthop", "10.0.0.2" },
+                            { "vni_label", "5000" }, { "router_mac", "00:00:0a:00:00:99" } } });
+        consumer->addToSync(entries);
+        route_entries_status = SAI_STATUS_TABLE_FULL;
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        route_entries_status = SAI_STATUS_SUCCESS;
+
+        EXPECT_FALSE(RouteInstalled(TN_IP + "/32"));
+        EXPECT_EQ(PendingRoutes(), 1u);
+        EXPECT_TRUE(gNeighOrch->isHwConfigured(TN_NEIGH));
+        EXPECT_TRUE(gNeighOrch->m_tunnelHostRoutes.empty());
+
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_TRUE(RouteInstalled(TN_IP + "/32"));
+        EXPECT_FALSE(gNeighOrch->isHwConfigured(TN_NEIGH));
+
+        TunnelHostRoute(DEL_COMMAND);
+        EXPECT_TRUE(gNeighOrch->isHwConfigured(TN_NEIGH));
+        gNeighOrch->m_syncdNextHops.erase(tunnel_nh);
+    }
+
+    /*
+     * The SAI refuses a host route over a tunnel and then the neighbor that
+     * stepped aside for it, and the route is withdrawn before a retry: the
+     * neighbor is retried on later neighbor passes until the SAI takes it.
+     */
+    TEST_F(RouteOrchTunnelMacTest, RefusedNeighborRestoreRetried)
+    {
+        RemoteMac(TN_MAC, "1.1.1.1");
+        LearnNeighbor(TN_IP, TN_MAC);
+        ASSERT_TRUE(gNeighOrch->isHwConfigured(TN_NEIGH));
+        NextHopKey tunnel_nh = AddTunnelNextHop();
+
+        route_entries_status = SAI_STATUS_TABLE_FULL;
+        FailNeighborCreates(SAI_STATUS_TABLE_FULL);
+        TunnelHostRoute(SET_COMMAND);
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        route_entries_status = SAI_STATUS_SUCCESS;
+
+        EXPECT_FALSE(RouteInstalled(TN_IP + "/32"));
+        EXPECT_EQ(PendingRoutes(), 1u);
+        EXPECT_FALSE(gNeighOrch->isHwConfigured(TN_NEIGH));
+        EXPECT_TRUE(gNeighOrch->m_tunnelHostRoutes.empty());
+
+        /* Withdrawn before a retry: nothing in RouteOrch brings the neighbor back */
+        TunnelHostRoute(DEL_COMMAND);
+        EXPECT_EQ(PendingRoutes(), 0u);
+        EXPECT_FALSE(gNeighOrch->isHwConfigured(TN_NEIGH));
+
+        static_cast<Orch *>(gNeighOrch)->doTask();
+        EXPECT_FALSE(gNeighOrch->isHwConfigured(TN_NEIGH));
+
+        FailNeighborCreates(SAI_STATUS_SUCCESS);
+        static_cast<Orch *>(gNeighOrch)->doTask();
+        EXPECT_TRUE(gNeighOrch->isHwConfigured(TN_NEIGH));
+        EXPECT_TRUE(gNeighOrch->m_tunnelMacNeighbors.empty());
         gNeighOrch->m_syncdNextHops.erase(tunnel_nh);
     }
 }

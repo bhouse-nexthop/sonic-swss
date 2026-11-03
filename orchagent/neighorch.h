@@ -174,6 +174,8 @@ private:
     std::set<NeighborEntry> m_tunnelMacNeighbors;
     /* Host routes (VRF, address) whose next hops are VxLAN tunnel next hops */
     std::set<std::pair<sai_object_id_t, IpAddress>> m_tunnelHostRoutes;
+    /* Neighbors the SAI refused to take back once their host route over a tunnel went away */
+    std::set<NeighborEntry> m_tunnelHostRouteRestores;
 
     void setNeighbor(const NeighborEntry &neighborEntry, const NeighborData &data);
     void eraseNeighbor(const NeighborEntry &neighborEntry);
@@ -202,7 +204,9 @@ private:
     bool removePrefixRouteForNeighbor(const IpAddress& ip_address, sai_object_id_t vrf_id);
     void processFDBFlushUpdate(const FdbFlushUpdate &);
 
+    void doTask() override;
     void doTask(Consumer &consumer);
+    void retryTunnelHostRouteRestores();
     void doVoqSystemNeighTask(Consumer &consumer);
 
     unique_ptr<Table> m_tableVoqSystemNeighTable;

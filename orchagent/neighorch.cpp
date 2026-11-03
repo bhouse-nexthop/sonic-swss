@@ -440,9 +440,11 @@ void NeighOrch::updateTunnelHostRoute(sai_object_id_t vrf_id, const IpAddress &i
 
         if (!present)
         {
-            if (m_tunnelMacNeighbors.count(neighborEntry))
+            if (m_tunnelMacNeighbors.count(neighborEntry) && !enableNeighbor(neighborEntry))
             {
-                enableNeighbor(neighborEntry);
+                SWSS_LOG_WARN("Neighbor %s on %s not programmed after its host route over a vxlan tunnel went away, "
+                              "retrying", ip.to_string().c_str(), neighborEntry.alias.c_str());
+                m_tunnelHostRouteRestores.insert(neighborEntry);
             }
         }
         else if (isHwConfigured(neighborEntry))
@@ -1233,6 +1235,38 @@ bool NeighOrch::getNeighborEntry(const IpAddress &ipAddress, string vrf_name, Ne
 
     NextHopKey nexthop(ipAddress, alias);
     return getNeighborEntry(nexthop, neighborEntry, macAddress);
+}
+
+void NeighOrch::doTask()
+{
+    Orch::doTask();
+    retryTunnelHostRouteRestores();
+}
+
+/*
+ * Retries on each pass the neighbors updateTunnelHostRoute() could not program
+ * again, as a failed neighbor update is retried. They stop being retried once
+ * addNeighbor() takes them, programmed or kept in software (MUX standby, a MAC
+ * behind a tunnel the SAI refuses), once removed, or once a host route over a
+ * tunnel carries them again.
+ */
+void NeighOrch::retryTunnelHostRouteRestores()
+{
+    if (m_tunnelHostRouteRestores.empty())
+    {
+        return;
+    }
+
+    vector<NeighborEntry> restores(m_tunnelHostRouteRestores.begin(), m_tunnelHostRouteRestores.end());
+    for (const auto &neighborEntry : restores)
+    {
+        Port vlan;
+        if (!m_tunnelMacNeighbors.count(neighborEntry) || !m_portsOrch->getPort(neighborEntry.alias, vlan) ||
+            hasTunnelHostRoute(vlan, neighborEntry.ip_address) || enableNeighbor(neighborEntry))
+        {
+            m_tunnelHostRouteRestores.erase(neighborEntry);
+        }
+    }
 }
 
 void NeighOrch::doTask(Consumer &consumer)

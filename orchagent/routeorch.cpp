@@ -2621,6 +2621,11 @@ bool RouteOrch::addRoutePost(const RouteBulkContext& ctx, const NextHopGroupKey 
             task_process_status handle_status = handleSaiCreateStatus(SAI_API_ROUTE, status);
             if (handle_status != task_success)
             {
+                if (ipPrefix.isFullMask())
+                {
+                    /* The host route is not in the SAI: its neighbors come back until a retry programs it */
+                    m_neighOrch->updateTunnelHostRoute(vrf_id, ipPrefix.getIp(), false);
+                }
                 return parseHandleSaiStatusFailure(handle_status);
             }
         }
@@ -2662,6 +2667,11 @@ bool RouteOrch::addRoutePost(const RouteBulkContext& ctx, const NextHopGroupKey 
                 task_process_status handle_status = handleSaiSetStatus(SAI_API_ROUTE, status);
                 if (handle_status != task_success)
                 {
+                    if (ipPrefix.isFullMask() && (it_status == object_statuses.end() || *it_status != SAI_STATUS_SUCCESS))
+                    {
+                        /* The next hop set failed too: the route keeps its previous next hops, none over a tunnel */
+                        m_neighOrch->updateTunnelHostRoute(vrf_id, ipPrefix.getIp(), false);
+                    }
                     return parseHandleSaiStatusFailure(handle_status);
                 }
             }
@@ -2676,6 +2686,10 @@ bool RouteOrch::addRoutePost(const RouteBulkContext& ctx, const NextHopGroupKey 
                 // This can happen in dualtor when a tunnel route is removed that matches a learned route
                 // remove the entry from the cache and retry route creation
                 m_syncdRoutes.at(vrf_id).erase(ipPrefix);
+                if (ipPrefix.isFullMask())
+                {
+                    m_neighOrch->updateTunnelHostRoute(vrf_id, ipPrefix.getIp(), false);
+                }
                 return false;
             }
             SWSS_LOG_ERROR("Failed to set route %s with next hop(s) %s",
@@ -2683,6 +2697,11 @@ bool RouteOrch::addRoutePost(const RouteBulkContext& ctx, const NextHopGroupKey 
             task_process_status handle_status = handleSaiSetStatus(SAI_API_ROUTE, status);
             if (handle_status != task_success)
             {
+                if (ipPrefix.isFullMask() && !it_route->second.nhg_key.is_overlay_nexthop())
+                {
+                    /* The route keeps its previous next hops, which are not over a tunnel */
+                    m_neighOrch->updateTunnelHostRoute(vrf_id, ipPrefix.getIp(), false);
+                }
                 return parseHandleSaiStatusFailure(handle_status);
             }
         }
