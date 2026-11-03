@@ -1738,6 +1738,13 @@ bool VxlanTunnelOrch::addOperation(const Request& request)
     return true;
 }
 
+bool VxlanTunnelOrch::isTunnelRowReplaced(const std::string& tunnel_name)
+{
+    std::vector<FieldValueTuple> fvs;
+    return isTunnelExists(tunnel_name) && m_appTunnelTable.get(tunnel_name, fvs) &&
+           !isTunnelRowBack(tunnel_name, *getVxlanTunnel(tunnel_name));
+}
+
 bool VxlanTunnelOrch::isTunnelRowBack(const std::string& tunnel_name, const VxlanTunnel& tunnel)
 {
     std::vector<FieldValueTuple> fvs;
@@ -1798,9 +1805,19 @@ bool VxlanTunnelOrch::delOperation(const Request& request)
     EvpnNvoOrch* evpn_orch = gDirectory.get<EvpnNvoOrch*>();
     bool nvo_uses_it = evpn_orch && evpn_orch->getEVPNVtep() == vtep_ptr;
     string held;
+    // Without the NVO nothing else retries a hw delete left pending by a refused bridge port.
+    if (vtep_ptr->del_tnl_hw_pending && !nvo_uses_it && vtep_ptr->vlan_vrf_vni_count == 0)
+    {
+        vtep_ptr->finishPendingSIPDelete();
+    }
     if (vtep_ptr->del_tnl_hw_pending)
     {
         held = "hw delete is pending";
+    }
+    else if (vtep_ptr->vlan_vrf_vni_count > 0)
+    {
+        // The last map DEL removes the tunnel hw: erasing the tunnel before it would leave the SAI tunnel behind.
+        held = "VNI maps still use it";
     }
     else if (nvo_uses_it)
     {
@@ -1816,8 +1833,9 @@ bool VxlanTunnelOrch::delOperation(const Request& request)
         return true;
     }
 
-    // The NVO's users release the tunnel through it, so the NVO lets go of it only once they are gone.
-    if (nvo_uses_it && evpn_orch->releaseForTunnelDelete())
+    // The NVO's users release the tunnel through it, so the NVO lets go of it only once they are gone. It stays
+    // bound while maps hold the DEL: were that DEL dropped as stale later, nothing would bind the NVO again.
+    if (nvo_uses_it && vtep_ptr->vlan_vrf_vni_count == 0 && evpn_orch->releaseForTunnelDelete())
     {
         held.clear();
     }
@@ -2196,6 +2214,23 @@ bool VxlanTunnelMapOrch::addOperation(const Request& request)
 
     if (isTunnelMapExists(full_tunnel_map_entry_name))
     {
+        // A DEL merged with this re-add while the tunnel's DEL is held. Once APPL_DB holds the tunnel with other
+        // attributes, remove the map so that DEL can finish: the map goes on the tunnel configured next. Until the
+        // row is back the SET waits, and a stale DEL is dropped on its retry first.
+        const auto map_tunnel_name = request.getKeyString(0);
+        VxlanTunnelOrch* map_tunnel_orch = gDirectory.get<VxlanTunnelOrch*>();
+        if (map_tunnel_orch->isDeleteHeld(map_tunnel_name))
+        {
+            // The SET stays pending either way: the held DEL finishes once the map is removed, and the map then
+            // goes on the next tunnel.
+            if (map_tunnel_orch->isTunnelRowReplaced(map_tunnel_name) &&
+                removeMap(map_tunnel_name, request.getKeyString(1), full_tunnel_map_entry_name))
+            {
+                SWSS_LOG_NOTICE("Vxlan tunnel map '%s' is removed for the held delete of its tunnel and added again",
+                                full_tunnel_map_entry_name.c_str());
+            }
+            return false;
+        }
         SWSS_LOG_ERROR("Vxlan tunnel map '%s' already exist", 
                       full_tunnel_map_entry_name.c_str());
         return true;
@@ -2310,10 +2345,13 @@ bool VxlanTunnelMapOrch::delOperation(const Request& request)
 {
     SWSS_LOG_ENTER();
 
+    return removeMap(request.getKeyString(0), request.getKeyString(1), request.getFullKey());
+}
+
+bool VxlanTunnelMapOrch::removeMap(const std::string& tunnel_name, const std::string& tunnel_map_entry_name,
+                                   const std::string& full_tunnel_map_entry_name)
+{
     Port vlanPort;
-    const auto& tunnel_name = request.getKeyString(0);
-    const auto& tunnel_map_entry_name = request.getKeyString(1);
-    const auto& full_tunnel_map_entry_name = request.getFullKey();
     VxlanTunnelOrch* tunnel_orch = gDirectory.get<VxlanTunnelOrch*>();
 
     if (!isTunnelMapExists(full_tunnel_map_entry_name))
@@ -2325,8 +2363,8 @@ bool VxlanTunnelMapOrch::delOperation(const Request& request)
     auto vlan_id = (sai_vlan_id_t) vxlan_tunnel_map_table_[full_tunnel_map_entry_name].vlan_id;
     if (!gPortsOrch->getVlanByVlanId(vlan_id, vlanPort))
     {
-        SWSS_LOG_ERROR("Delete VLAN-VNI map.vlan id doesn't exist: %d", vlan_id);
-        return true;
+        // The VLAN can be removed first: the map entry, the tunnel's map count and its hw still go.
+        SWSS_LOG_NOTICE("Delete VLAN-VNI map: vlan id %d is already removed", vlan_id);
     }
 
     vlanPort.m_vnid = (uint32_t) VNID_NONE;
@@ -2375,21 +2413,26 @@ bool VxlanTunnelMapOrch::delOperation(const Request& request)
               if (!ret)
               {
                   SWSS_LOG_ERROR("Get port failed for source vtep %s", port_tunnel_name.c_str());
-                  return true;
               }
-              ret = gPortsOrch->removeBridgePort(tunnelPort);
-              if (!ret)
+              else if (!gPortsOrch->removeBridgePort(tunnelPort))
               {
                   SWSS_LOG_ERROR("Remove Bridge port failed for source vtep = %s fdbcount = %d",
                                  port_tunnel_name.c_str(), tunnelPort.m_fdb_count);
-                  return true;
+                  // The hw delete is finished once the tunnel port is released; the tunnel DEL waits for it.
+                  tunnel_obj->del_tnl_hw_pending = true;
               }
-              gPortsOrch->removeTunnel(tunnelPort);
+              else
+              {
+                  gPortsOrch->removeTunnel(tunnelPort);
+              }
           }
-          uint8_t mapper_list=0;
-          TUNNELMAP_SET_VLAN(mapper_list);
-          TUNNELMAP_SET_VRF(mapper_list);
-          tunnel_obj->deleteTunnelHw(mapper_list, TUNNEL_MAP_USE_DEDICATED_ENCAP_DECAP);
+          if (!tunnel_obj->del_tnl_hw_pending)
+          {
+              uint8_t mapper_list=0;
+              TUNNELMAP_SET_VLAN(mapper_list);
+              TUNNELMAP_SET_VRF(mapper_list);
+              tunnel_obj->deleteTunnelHw(mapper_list, TUNNEL_MAP_USE_DEDICATED_ENCAP_DECAP);
+          }
       }
       else
       {
@@ -2615,7 +2658,8 @@ bool VxlanVrfMapOrch::delOperation(const Request& request)
         remove_tunnel_map_entry(entry.decap_id);
         vrf_orch->decreaseVrfRefCount(vrf_name);
 
-        if(entry.isL2Vni)
+        // Only a VLAN map that is still configured gets its entry back.
+        if (entry.isL2Vni && vxlan_tun_map_orch->isTunnelMapExists(entry.vniVlanMapName))
         {
             const auto tunnel_map_id = tunnel_obj->getDecapMapId(TUNNEL_MAP_T_VLAN);
             SWSS_LOG_NOTICE("Adding tunnel map entry. Tunnel: %s %s",tunnel_name.c_str(),entry.vniVlanMapName.c_str());
