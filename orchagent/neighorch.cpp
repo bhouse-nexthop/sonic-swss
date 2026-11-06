@@ -32,6 +32,7 @@ extern string gMyAsicName;
 extern bool isVoqChassisDbInUse();
 
 const int neighorch_pri = 30;
+#define TUNNEL_HOST_ROUTE_RESTORE_RETRY_SEC 1
 
 NeighOrch::NeighOrch(DBConnector *appDb, string tableName, IntfsOrch *intfsOrch, FdbOrch *fdbOrch, PortsOrch *portsOrch, DBConnector *chassisAppDb) :
         gNeighBulker(sai_neighbor_api, gMaxBulkSize),
@@ -64,6 +65,10 @@ NeighOrch::NeighOrch(DBConnector *appDb, string tableName, IntfsOrch *intfsOrch,
         stateDb = make_unique<DBConnector>("STATE_DB", 0);
         m_stateSystemNeighTable = unique_ptr<Table>(new Table(stateDb.get(), STATE_SYSTEM_NEIGH_TABLE_NAME));
     }
+
+    /* Runs only while a neighbor waits in m_tunnelHostRouteRestores */
+    m_tunnelHostRouteRestoreTimer = new SelectableTimer(timespec { .tv_sec = TUNNEL_HOST_ROUTE_RESTORE_RETRY_SEC, .tv_nsec = 0 });
+    Orch::addExecutor(new ExecutableTimer(m_tunnelHostRouteRestoreTimer, this, "NEIGH_TUNNEL_HOST_ROUTE_RESTORE"));
 }
 
 NeighOrch::~NeighOrch()
@@ -444,6 +449,10 @@ void NeighOrch::updateTunnelHostRoute(sai_object_id_t vrf_id, const IpAddress &i
             {
                 SWSS_LOG_WARN("Neighbor %s on %s not programmed after its host route over a vxlan tunnel went away, "
                               "retrying", ip.to_string().c_str(), neighborEntry.alias.c_str());
+                if (m_tunnelHostRouteRestores.empty())
+                {
+                    m_tunnelHostRouteRestoreTimer->start();
+                }
                 m_tunnelHostRouteRestores.insert(neighborEntry);
             }
         }
@@ -1237,35 +1246,41 @@ bool NeighOrch::getNeighborEntry(const IpAddress &ipAddress, string vrf_name, Ne
     return getNeighborEntry(nexthop, neighborEntry, macAddress);
 }
 
-void NeighOrch::doTask()
+void NeighOrch::doTask(SelectableTimer &timer)
 {
-    Orch::doTask();
-    retryTunnelHostRouteRestores();
+    if (&timer == m_tunnelHostRouteRestoreTimer)
+    {
+        retryTunnelHostRouteRestores();
+    }
 }
 
 /*
- * Retries on each pass the neighbors updateTunnelHostRoute() could not program
- * again, as a failed neighbor update is retried. They stop being retried once
- * addNeighbor() takes them, programmed or kept in software (MUX standby, a MAC
- * behind a tunnel the SAI refuses), once removed, or once a host route over a
- * tunnel carries them again.
+ * Retries, on a timer, the neighbors updateTunnelHostRoute() could not program
+ * again. They stop being retried once addNeighbor() takes them, programmed or
+ * kept in software (MUX standby, a MAC behind a tunnel the SAI refuses), once
+ * removed, or once a host route over a tunnel carries them again. One whose
+ * VLAN has no router interface waits for it without a SAI call.
  */
 void NeighOrch::retryTunnelHostRouteRestores()
 {
-    if (m_tunnelHostRouteRestores.empty())
-    {
-        return;
-    }
-
     vector<NeighborEntry> restores(m_tunnelHostRouteRestores.begin(), m_tunnelHostRouteRestores.end());
     for (const auto &neighborEntry : restores)
     {
         Port vlan;
         if (!m_tunnelMacNeighbors.count(neighborEntry) || !m_portsOrch->getPort(neighborEntry.alias, vlan) ||
-            hasTunnelHostRoute(vlan, neighborEntry.ip_address) || enableNeighbor(neighborEntry))
+            hasTunnelHostRoute(vlan, neighborEntry.ip_address))
         {
             m_tunnelHostRouteRestores.erase(neighborEntry);
         }
+        else if (vlan.m_rif_id != SAI_NULL_OBJECT_ID && enableNeighbor(neighborEntry))
+        {
+            m_tunnelHostRouteRestores.erase(neighborEntry);
+        }
+    }
+
+    if (m_tunnelHostRouteRestores.empty())
+    {
+        m_tunnelHostRouteRestoreTimer->stop();
     }
 }
 

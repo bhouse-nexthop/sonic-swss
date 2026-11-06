@@ -2667,9 +2667,9 @@ bool RouteOrch::addRoutePost(const RouteBulkContext& ctx, const NextHopGroupKey 
                 task_process_status handle_status = handleSaiSetStatus(SAI_API_ROUTE, status);
                 if (handle_status != task_success)
                 {
-                    if (ipPrefix.isFullMask() && (it_status == object_statuses.end() || *it_status != SAI_STATUS_SUCCESS))
+                    if (ipPrefix.isFullMask() && object_statuses.back() != SAI_STATUS_SUCCESS)
                     {
-                        /* The next hop set failed too: the route keeps its previous next hops, none over a tunnel */
+                        /* The next hop set, staged last, failed too: the route keeps its previous next hops, none over a tunnel */
                         m_neighOrch->updateTunnelHostRoute(vrf_id, ipPrefix.getIp(), false);
                     }
                     return parseHandleSaiStatusFailure(handle_status);

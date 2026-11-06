@@ -2385,7 +2385,8 @@ namespace routeorch_test
     /*
      * The SAI refuses a host route over a tunnel and then the neighbor that
      * stepped aside for it, and the route is withdrawn before a retry: the
-     * neighbor is retried on later neighbor passes until the SAI takes it.
+     * neighbor is retried on the restore timer until the SAI takes it, and not
+     * while its VLAN has no router interface.
      */
     TEST_F(RouteOrchTunnelMacTest, RefusedNeighborRestoreRetried)
     {
@@ -2410,13 +2411,31 @@ namespace routeorch_test
         EXPECT_EQ(PendingRoutes(), 0u);
         EXPECT_FALSE(gNeighOrch->isHwConfigured(TN_NEIGH));
 
-        static_cast<Orch *>(gNeighOrch)->doTask();
+        EXPECT_EQ(gNeighOrch->m_tunnelHostRouteRestores.size(), 1u);
+
+        auto &restoreTimer = *gNeighOrch->m_tunnelHostRouteRestoreTimer;
+        gNeighOrch->doTask(restoreTimer);
         EXPECT_FALSE(gNeighOrch->isHwConfigured(TN_NEIGH));
 
+        /* Neither a neighbor pass nor the timer tries it while the VLAN has no router interface */
         FailNeighborCreates(SAI_STATUS_SUCCESS);
         static_cast<Orch *>(gNeighOrch)->doTask();
+        EXPECT_FALSE(gNeighOrch->isHwConfigured(TN_NEIGH));
+        Port vlan;
+        ASSERT_TRUE(gPortsOrch->getPort(TN_NEIGH.alias, vlan));
+        const sai_object_id_t rif_id = vlan.m_rif_id;
+        vlan.m_rif_id = SAI_NULL_OBJECT_ID;
+        gPortsOrch->setPort(vlan.m_alias, vlan);
+        gNeighOrch->doTask(restoreTimer);
+        EXPECT_FALSE(gNeighOrch->isHwConfigured(TN_NEIGH));
+        EXPECT_EQ(gNeighOrch->m_tunnelHostRouteRestores.size(), 1u);
+
+        vlan.m_rif_id = rif_id;
+        gPortsOrch->setPort(vlan.m_alias, vlan);
+        gNeighOrch->doTask(restoreTimer);
         EXPECT_TRUE(gNeighOrch->isHwConfigured(TN_NEIGH));
         EXPECT_TRUE(gNeighOrch->m_tunnelMacNeighbors.empty());
+        EXPECT_TRUE(gNeighOrch->m_tunnelHostRouteRestores.empty());
         gNeighOrch->m_syncdNextHops.erase(tunnel_nh);
     }
 }
